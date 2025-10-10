@@ -2,7 +2,7 @@ import torch.nn as nn
 from torch.distributions.categorical import Categorical
 import torch as T
 import torch.optim as opt
-import sys
+
 
 class Memory:
     def __init__(self, batch_size: int):
@@ -35,7 +35,7 @@ class Memory:
         self.dones.append(done)
 
     def get_batch(self) -> tuple:
-        start = T.arange(0, len(self.states), 32)
+        start = T.arange(0, len(self.states), self.batch_size)
         indices = T.randperm(len(self.states))
         batches = [indices[i:i + self.batch_size] for i in start]
         return T.stack(self.states), T.stack(self.state_vals), T.stack(self.next_states), T.stack(self.next_state_vals), T.stack(self.actions), T.stack(self.probs), T.stack(self.rewards), batches
@@ -58,6 +58,7 @@ class Actor(nn.Module):
         super(Actor, self).__init__()
         self.in_features = in_features
         self.out_features = out_features
+        self.hidden_size = hidden_size
         self.layers = nn.Sequential(
             nn.Linear(in_features, hidden_size),
             nn.ReLU(),
@@ -76,6 +77,7 @@ class Critic(nn.Module):
         super(Critic, self).__init__()
         self.in_features = in_features
         self.out_features = out_features
+        self.hidden_size = hidden_size
         self.layers = nn.Sequential(
             nn.Linear(in_features, hidden_size),
             nn.ReLU(),
@@ -89,7 +91,7 @@ class Critic(nn.Module):
 
 
 class Agent():
-    def __init__(self, actor: Actor, critic: Critic, epsilon: float, gamma: float, lam: float, actor_lr: float, critic_lr: float, device: str, batch_size: int):
+    def __init__(self, actor: Actor, critic: Critic, epsilon: float, gamma: float, lam: float, c1: float, c2: float, actor_lr: float, critic_lr: float, device: str, batch_size: int, tuning: bool = False):
         self.actor = actor
         self.critic = critic
         self.epsilon = epsilon
@@ -101,8 +103,11 @@ class Agent():
         self.critic_opt = opt.Adam(critic.parameters())
         self.device = device
         self.memory = Memory(batch_size)
+        self.c1 = c1
+        self.c2 = c2
         self.all_rewards = []
         self.all_steps = []
+        self.tuning = tuning
 
     def save_agent(self, path: str) -> None:
         T.save({
@@ -116,29 +121,37 @@ class Agent():
                 'lam': self.lam,
                 'actor_in_feats': self.actor.in_features,
                 'actor_out_feats': self.actor.out_features,
+                'actor_hs': self.actor.hidden_size,
                 'critic_in_feats': self.critic.in_features,
-                'critic_out_feats': self.critic.out_features
+                'critic_out_feats': self.critic.out_features,
+                'critic_hs': self.critic.hidden_size,
+                'batch_size': self.memory.batch_size,
+                'c1': self.c1,
+                'c2': self.c2,
             }
         }, path)
 
     @staticmethod
-    def load_agent(env, path: str) -> 'Agent':
-        chckpt = T.load(path)
+    def load_agent(path: str, device: str) -> 'Agent':
+        chckpt = T.load(path, map_location = T.device(device))
 
-        actor = Actor(chckpt['hyperparameters']['actor_in_feats'], chckpt['hyperparameters']['actor_out_feats'])
-        critic = Critic(chckpt['hyperparameters']['critic_in_feats'], chckpt['hyperparameters']['critic_out_feats'])
+        actor = Actor(chckpt['hyperparameters']['actor_in_feats'], chckpt['hyperparameters']['actor_out_feats'], chckpt['hyperparameters']['actor_hs'])
+        critic = Critic(chckpt['hyperparameters']['critic_in_feats'], chckpt['hyperparameters']['critic_out_feats'], chckpt['hyperparameters']['critic_hs'])
         actor.load_state_dict(chckpt['actor'])
         critic.load_state_dict(chckpt['critic'])
 
         return Agent(
-            env, 
             actor, 
             critic, 
             chckpt['hyperparameters']['epsilon'],
             chckpt['hyperparameters']['gamma'],
             chckpt['hyperparameters']['lam'],
+            chckpt['hyperparameters']['c1'],
+            chckpt['hyperparameters']['c2'],
             chckpt['hyperparameters']['actor_lr'],
-            chckpt['hyperparameters']['critic_lr']
+            chckpt['hyperparameters']['critic_lr'],
+            device,
+            chckpt['hyperparameters']['batch_size']
         )
 
     def select_action(self, states: T.tensor) -> tuple:
@@ -150,8 +163,8 @@ class Agent():
     def get_state_values(self, states: T.tensor) -> T.tensor:
         return self.critic.forward(states)
 
-    def update_nets(self, actor_loss: T.tensor, critic_loss: T.tensor) -> None:
-        total_loss = actor_loss + 0.5 * critic_loss
+    def update_nets(self, actor_loss: T.tensor, critic_loss: T.tensor, entropy: T.tensor) -> None:
+        total_loss = actor_loss + self.c1 * critic_loss - self.c2 * entropy
         self.actor_opt.zero_grad()
         self.critic_opt.zero_grad()
         total_loss.backward()
@@ -176,7 +189,7 @@ class Agent():
 
         for _ in range(K):
             for batch in batches:
-                b_states = states[batch].detach()
+                b_states = states[batch]
                 b_state_vals = state_vals[batch].detach()
                 b_old_probs = probs[batch].detach() # get action probabilites from samples
                 b_actions = actions[batch] # get selected actions from samples
@@ -192,6 +205,72 @@ class Agent():
                 actor_loss = -T.min(ratio * b_advantages, 
                                     T.clamp(ratio, 1 - self.epsilon, 1 + self.epsilon) * b_advantages).mean()
                 
-                self.update_nets(actor_loss, critic_loss)
+                self.update_nets(actor_loss, critic_loss, dists.entropy().mean())
 
 
+def train(env, agent: Agent, train_iters: int, timesteps: int, K: int, verbose: bool = True):
+    best_reward = float('-inf')
+    
+    for train_iter in range(train_iters):
+        ep_reward = 0
+        ep_steps = 0
+
+        states, _ = env.reset()
+        states = T.from_numpy(states).to(agent.device)
+
+        for _ in range(timesteps):
+            actions, probs = agent.select_action(states)
+            state_vals = agent.get_state_values(states)
+
+            next_states, rewards, dones, terminated, _ = env.step(actions.detach().cpu().numpy())
+            next_states = T.from_numpy(next_states).to(agent.device)
+            rewards = T.from_numpy(rewards)
+            dones = T.from_numpy(dones)
+
+            ep_reward += sum(rewards).item()
+
+            next_state_vals = agent.get_state_values(next_states)
+            for state, state_val, next_state, next_state_val, action, prob, reward, done in zip(states, state_vals, next_states, next_state_vals, actions, probs, rewards, dones):
+                agent.memory.add(state, state_val, next_state, next_state_val, action, prob, reward, done)
+
+            states = next_states
+            ep_steps += 1
+        
+        if verbose:
+            print('finished episode:', train_iter)
+            print('total reward:', ep_reward)
+            print('number of steps:', ep_steps)
+            print('-' * 15)
+
+        agent.fit(K)
+        agent.memory.clear_memory()
+        agent.all_rewards.append(ep_reward)
+        agent.all_steps.append(ep_steps)
+
+        if ep_reward > best_reward and not agent.tuning:
+            best_reward = ep_reward
+            agent.save_agent('models/cartpole_agent.pt')
+            print('new best model... saving...')
+
+
+def evaluate(eval_env, agent):
+    eval_rewards = 0
+    eval_episodes = 100
+    for _ in range(eval_episodes):
+        done, truncated = False, False
+        state, _ = eval_env.reset()
+        total_reward = 0
+
+        while not (done or truncated):
+            state_t = T.tensor(state, dtype = T.float32).unsqueeze(0).to(agent.device)
+            with T.no_grad():
+                dist = agent.actor(state_t)
+                action = dist.probs.argmax(dim = 1)
+                state, reward, done, truncated, _ = eval_env.step(action.item())
+                total_reward += reward
+
+        print("evaluation reward:", total_reward)
+        eval_rewards += total_reward
+
+    eval_env.close()
+    print('average reward:', eval_rewards / eval_episodes)
