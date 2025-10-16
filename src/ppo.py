@@ -38,15 +38,13 @@ class Memory:
         start = T.arange(0, len(self.states), self.batch_size)
         indices = T.randperm(len(self.states))
         batches = [indices[i:i + self.batch_size] for i in start]
-        return T.stack(self.states), T.stack(self.state_vals), T.stack(self.next_states), T.stack(self.next_state_vals), T.stack(self.actions), T.stack(self.probs), T.stack(self.rewards), batches
+        return T.stack(self.states), T.stack(self.state_vals), T.stack(self.next_states), T.stack(self.next_state_vals), T.stack(self.actions), T.stack(self.probs), T.stack(self.rewards), T.stack(self.dones), batches
 
     def clear_memory(self) -> None:
         self.states.clear()
         self.state_vals.clear()
-
         self.next_states.clear()
         self.next_state_vals.clear()
-
         self.actions.clear()
         self.probs.clear()
         self.rewards.clear()
@@ -99,8 +97,8 @@ class Agent():
         self.lam = lam
         self.actor_lr = actor_lr
         self.critic_lr = critic_lr
-        self.actor_opt = opt.Adam(actor.parameters())
-        self.critic_opt = opt.Adam(critic.parameters())
+        self.actor_opt = opt.AdamW(actor.parameters())
+        self.critic_opt = opt.AdamW(critic.parameters())
         self.device = device
         self.memory = Memory(batch_size)
         self.c1 = c1
@@ -135,8 +133,8 @@ class Agent():
     def load_agent(path: str, device: str) -> 'Agent':
         chckpt = T.load(path, map_location = T.device(device))
 
-        actor = Actor(chckpt['hyperparameters']['actor_in_feats'], chckpt['hyperparameters']['actor_out_feats'], chckpt['hyperparameters']['actor_hs'])
-        critic = Critic(chckpt['hyperparameters']['critic_in_feats'], chckpt['hyperparameters']['critic_out_feats'], chckpt['hyperparameters']['critic_hs'])
+        actor = Actor(chckpt['hyperparameters']['actor_in_feats'], chckpt['hyperparameters']['actor_out_feats'], chckpt['hyperparameters']['actor_hs']).to(device)
+        critic = Critic(chckpt['hyperparameters']['critic_in_feats'], chckpt['hyperparameters']['critic_out_feats'], chckpt['hyperparameters']['critic_hs']).to(device)
         actor.load_state_dict(chckpt['actor'])
         critic.load_state_dict(chckpt['critic'])
 
@@ -172,15 +170,15 @@ class Agent():
         self.critic_opt.step()
 
     def fit(self, K: int) -> None:        
-        states, state_vals, next_states, next_state_vals, actions, probs, rewards, batches = self.memory.get_batch()
+        states, state_vals, next_states, next_state_vals, actions, probs, rewards, dones, batches = self.memory.get_batch()
         length = len(states)
 
         advantage = 0
         advantages = []
 
         for t in reversed(range(length)):
-            delta = rewards[t].to(self.device) + self.gamma * next_state_vals[t] - state_vals[t]
-            advantage = delta + self.gamma * self.lam * advantage
+            delta = rewards[t] + self.gamma * (1 - dones[t].float()) * next_state_vals[t] - state_vals[t]
+            advantage = delta + self.gamma * self.lam * (1 - dones[t].float()) * advantage
             advantages.append(advantage)
 
         advantages = advantages[::-1]
@@ -208,7 +206,7 @@ class Agent():
                 self.update_nets(actor_loss, critic_loss, dists.entropy().mean())
 
 
-def train(env, agent: Agent, train_iters: int, timesteps: int, K: int, verbose: bool = True):
+def train(env, agent: Agent, train_iters: int, timesteps: int, K: int, save_path: str, verbose: bool = False):
     best_reward = float('-inf')
     
     for train_iter in range(train_iters):
@@ -216,16 +214,12 @@ def train(env, agent: Agent, train_iters: int, timesteps: int, K: int, verbose: 
         ep_steps = 0
 
         states, _ = env.reset()
-        states = T.from_numpy(states).to(agent.device)
-
+        
         for _ in range(timesteps):
             actions, probs = agent.select_action(states)
             state_vals = agent.get_state_values(states)
 
-            next_states, rewards, dones, terminated, _ = env.step(actions.detach().cpu().numpy())
-            next_states = T.from_numpy(next_states).to(agent.device)
-            rewards = T.from_numpy(rewards)
-            dones = T.from_numpy(dones)
+            next_states, rewards, dones, terminated, _ = env.step(actions.cpu())
 
             ep_reward += sum(rewards).item()
 
@@ -249,23 +243,21 @@ def train(env, agent: Agent, train_iters: int, timesteps: int, K: int, verbose: 
 
         if ep_reward > best_reward and not agent.tuning:
             best_reward = ep_reward
-            agent.save_agent('models/cartpole_agent.pt')
+            agent.save_agent(save_path)
             print('new best model... saving...')
 
 
-def evaluate(eval_env, agent):
+def evaluate(eval_env, eval_episodes, agent):
     eval_rewards = 0
-    eval_episodes = 100
     for _ in range(eval_episodes):
         done, truncated = False, False
         state, _ = eval_env.reset()
         total_reward = 0
 
         while not (done or truncated):
-            state_t = T.tensor(state, dtype = T.float32).unsqueeze(0).to(agent.device)
             with T.no_grad():
-                dist = agent.actor(state_t)
-                action = dist.probs.argmax(dim = 1)
+                dist = agent.actor(state)
+                action = dist.probs.argmax()
                 state, reward, done, truncated, _ = eval_env.step(action.item())
                 total_reward += reward
 
