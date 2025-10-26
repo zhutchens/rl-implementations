@@ -62,6 +62,8 @@ class Actor(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_size, hidden_size),
             nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
             nn.Linear(hidden_size, out_features),
         )
 
@@ -162,33 +164,64 @@ class Agent():
         return self.critic.forward(states)
 
     def update_nets(self, actor_loss: T.tensor, critic_loss: T.tensor, entropy: T.tensor) -> None:
-        total_loss = actor_loss + self.c1 * critic_loss - self.c2 * entropy
+    #     total_loss = actor_loss + self.c1 * critic_loss - self.c2 * entropy
+    #     self.actor_opt.zero_grad()
+    #     self.critic_opt.zero_grad()
+    #     total_loss.backward()
+    #     self.actor_opt.step()
+    #     self.critic_opt.step()
+        actor_loss = actor_loss - self.c2 * entropy
         self.actor_opt.zero_grad()
-        self.critic_opt.zero_grad()
-        total_loss.backward()
+        actor_loss.backward()
+        T.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
         self.actor_opt.step()
+
+        critic_loss = self.c1 * critic_loss
+        self.critic_opt.zero_grad()
+        critic_loss.backward()
+        T.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
         self.critic_opt.step()
 
-    def fit(self, K: int) -> None:        
-        states, state_vals, next_states, next_state_vals, actions, probs, rewards, dones, batches = self.memory.get_batch()
+    def fit(self, K: int, num_envs: int) -> None:        
+        states, state_vals, _, next_state_vals, actions, probs, rewards, dones, batches = self.memory.get_batch()
         length = len(states)
 
-        advantage = 0
-        advantages = []
+        num_steps = length // num_envs
 
-        for t in reversed(range(length)):
-            delta = rewards[t] + self.gamma * (1 - dones[t].float()) * next_state_vals[t] - state_vals[t]
-            advantage = delta + self.gamma * self.lam * (1 - dones[t].float()) * advantage
-            advantages.append(advantage)
+        state_vals = state_vals.detach()
+        next_state_vals = next_state_vals.detach()
 
-        advantages = advantages[::-1]
-        advantages = T.stack(advantages).to(self.device)
+        state_vals = state_vals.view(num_steps, num_envs)
+        state_vals = state_vals.to(self.device)
+        next_state_vals = next_state_vals.view(num_steps, num_envs)
+        next_state_vals = next_state_vals.to(self.device)
+        rewards = rewards.view(num_steps, num_envs)
+        rewards = rewards.to(self.device)
+        dones = dones.view(num_steps, num_envs)
+        dones = dones.to(self.device)
+
+        # compute gae per environment
+        advantages = T.zeros_like(rewards).to(self.device)
+        gae = T.zeros(num_envs).to(self.device)
+
+        for t in reversed(range(num_steps)):
+            mask = 1.0 - dones[t].float()
+            delta = rewards[t] + self.gamma * mask * next_state_vals[t] - state_vals[t]
+            gae = delta + self.gamma * self.lam * mask * gae
+            advantages[t] = gae
+
+        advantages = advantages.view(-1)
+        state_vals = state_vals.view(-1)
+        returns = advantages + state_vals
+
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        
+        returns = advantages + state_vals
 
         for _ in range(K):
             for batch in batches:
                 b_states = states[batch]
-                b_state_vals = state_vals[batch].detach()
+                # b_state_vals = state_vals[batch].detach()
                 b_old_probs = probs[batch].detach() # get action probabilites from samples
                 b_actions = actions[batch] # get selected actions from samples
                 b_advantages = advantages[batch].detach()
@@ -197,16 +230,15 @@ class Agent():
                 new_probs = dists.log_prob(b_actions)
                 ratio = (new_probs - b_old_probs).exp()
 
-                G_vals = b_advantages + b_state_vals
-
-                critic_loss = ((G_vals.detach() - self.get_state_values(b_states)) ** 2).mean() # loss for critic network
+                # critic_loss = ((G_vals.detach() - self.get_state_values(b_states)) ** 2).mean() # loss for critic network
+                critic_loss = ((returns[batch] - self.get_state_values(b_states)) ** 2).mean()
                 actor_loss = -T.min(ratio * b_advantages, 
-                                    T.clamp(ratio, 1 - self.epsilon, 1 + self.epsilon) * b_advantages).mean()
+                                T.clamp(ratio, 1 - self.epsilon, 1 + self.epsilon) * b_advantages).mean()
                 
                 self.update_nets(actor_loss, critic_loss, dists.entropy().mean())
 
 
-def train(env, agent: Agent, train_iters: int, timesteps: int, K: int, save_path: str, verbose: bool = False):
+def train(env, agent: Agent, num_envs: int, train_iters: int, timesteps: int, K: int, save_path: str, verbose: bool = False):
     best_reward = float('-inf')
     
     for train_iter in range(train_iters):
@@ -216,10 +248,12 @@ def train(env, agent: Agent, train_iters: int, timesteps: int, K: int, save_path
         states, _ = env.reset()
         
         for _ in range(timesteps):
+            states = states.to(agent.device)
             actions, probs = agent.select_action(states)
             state_vals = agent.get_state_values(states)
 
             next_states, rewards, dones, terminated, _ = env.step(actions.cpu())
+            next_states = next_states.to(agent.device)
 
             ep_reward += sum(rewards).item()
 
@@ -236,7 +270,7 @@ def train(env, agent: Agent, train_iters: int, timesteps: int, K: int, save_path
             print('number of steps:', ep_steps)
             print('-' * 15)
 
-        agent.fit(K)
+        agent.fit(K, num_envs)
         agent.memory.clear_memory()
         agent.all_rewards.append(ep_reward)
         agent.all_steps.append(ep_steps)
@@ -245,6 +279,8 @@ def train(env, agent: Agent, train_iters: int, timesteps: int, K: int, save_path
             best_reward = ep_reward
             agent.save_agent(save_path)
             print('new best model... saving...')
+    
+    print('finished training with best reward:', best_reward)
 
 
 def evaluate(eval_env, eval_episodes, agent):
@@ -256,13 +292,15 @@ def evaluate(eval_env, eval_episodes, agent):
 
         while not (done or truncated):
             with T.no_grad():
+                state = state.to(agent.device)
                 dist = agent.actor(state)
                 action = dist.probs.argmax()
-                state, reward, done, truncated, _ = eval_env.step(action.item())
+                state, reward, done, truncated, _ = eval_env.step(action.unsqueeze(0).cpu())
                 total_reward += reward
 
-        print("evaluation reward:", total_reward)
-        eval_rewards += total_reward
+        print("evaluation reward:", total_reward.item())
+        eval_rewards += total_reward.item()
 
     eval_env.close()
     print('average reward:', eval_rewards / eval_episodes)
+
