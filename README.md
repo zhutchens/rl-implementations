@@ -1,1 +1,1 @@
-In progress project to implement various RL architectures. Currently I am working on proximal policy optimization, next will be deep q-learning. 
+In progress project to implement various RL architectures. PPO is fully implemented, moving to DQN and Q-learning soon.
