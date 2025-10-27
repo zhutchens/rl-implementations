@@ -99,8 +99,8 @@ class Agent():
         self.lam = lam
         self.actor_lr = actor_lr
         self.critic_lr = critic_lr
-        self.actor_opt = opt.AdamW(actor.parameters())
-        self.critic_opt = opt.AdamW(critic.parameters())
+        self.actor_opt = opt.AdamW(actor.parameters(), lr = actor_lr)
+        self.critic_opt = opt.AdamW(critic.parameters(), lr = critic_lr)
         self.device = device
         self.memory = Memory(batch_size)
         self.c1 = c1
@@ -164,12 +164,6 @@ class Agent():
         return self.critic.forward(states)
 
     def update_nets(self, actor_loss: T.tensor, critic_loss: T.tensor, entropy: T.tensor) -> None:
-    #     total_loss = actor_loss + self.c1 * critic_loss - self.c2 * entropy
-    #     self.actor_opt.zero_grad()
-    #     self.critic_opt.zero_grad()
-    #     total_loss.backward()
-    #     self.actor_opt.step()
-    #     self.critic_opt.step()
         actor_loss = actor_loss - self.c2 * entropy
         self.actor_opt.zero_grad()
         actor_loss.backward()
@@ -215,8 +209,6 @@ class Agent():
         returns = advantages + state_vals
 
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        
-        returns = advantages + state_vals
 
         for _ in range(K):
             for batch in batches:
@@ -230,8 +222,7 @@ class Agent():
                 new_probs = dists.log_prob(b_actions)
                 ratio = (new_probs - b_old_probs).exp()
 
-                # critic_loss = ((G_vals.detach() - self.get_state_values(b_states)) ** 2).mean() # loss for critic network
-                critic_loss = ((returns[batch] - self.get_state_values(b_states)) ** 2).mean()
+                critic_loss = ((returns[batch] - self.get_state_values(b_states).squeeze()) ** 2).mean()
                 actor_loss = -T.min(ratio * b_advantages, 
                                 T.clamp(ratio, 1 - self.epsilon, 1 + self.epsilon) * b_advantages).mean()
                 
@@ -280,11 +271,13 @@ def train(env, agent: Agent, num_envs: int, train_iters: int, timesteps: int, K:
             agent.save_agent(save_path)
             print('new best model... saving...')
     
-    print('finished training with best reward:', best_reward)
+    if verbose:
+        print('finished training with best reward:', best_reward)
 
 
 def evaluate(eval_env, eval_episodes, agent):
     eval_rewards = 0
+
     for _ in range(eval_episodes):
         done, truncated = False, False
         state, _ = eval_env.reset()
