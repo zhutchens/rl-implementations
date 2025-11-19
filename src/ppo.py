@@ -124,6 +124,7 @@ class Agent():
             'actor': self.actor.state_dict(),
             'critic': self.critic.state_dict(),
             'hyperparameters': {
+                'continuous': self.actor.continuous,
                 'actor_lr': self.actor_lr,
                 'critic_lr': self.critic_lr,
                 'epsilon': self.epsilon,
@@ -145,7 +146,7 @@ class Agent():
     def load_agent(path: str, device: str) -> 'Agent':
         chckpt = T.load(path, map_location = T.device(device))
 
-        actor = Actor(chckpt['hyperparameters']['actor_in_feats'], chckpt['hyperparameters']['actor_out_feats'], chckpt['hyperparameters']['actor_hs']).to(device)
+        actor = Actor(chckpt['hyperparameters']['actor_in_feats'], chckpt['hyperparameters']['actor_out_feats'], chckpt['hyperparameters']['actor_hs'], chckpt['hyperparameters']['continuous']).to(device)
         critic = Critic(chckpt['hyperparameters']['critic_in_feats'], chckpt['hyperparameters']['critic_out_feats'], chckpt['hyperparameters']['critic_hs']).to(device)
         actor.load_state_dict(chckpt['actor'])
         critic.load_state_dict(chckpt['critic'])
@@ -302,10 +303,15 @@ def evaluate(eval_env, eval_episodes, agent):
 
         while not (done or truncated):
             with T.no_grad():
-                state = state.to(agent.device)
+                state = state.to(agent.device, dtype = T.float32)
                 dist = agent.actor(state)
-                action = dist.probs.argmax()
-                state, reward, done, truncated, _ = eval_env.step(action.unsqueeze(0).cpu())
+                if agent.actor.continuous:
+                    action = dist.mean
+                else:
+                    action = dist.probs.argmax()
+                    action = action.unsqueeze(0)
+
+                state, reward, done, truncated, _ = eval_env.step(action.cpu())
                 total_reward += reward
 
         print("evaluation reward:", total_reward.item())
