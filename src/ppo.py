@@ -1,5 +1,5 @@
 import torch.nn as nn
-from torch.distributions.categorical import Categorical
+from torch.distributions import Categorical, Normal
 import torch as T
 import torch.optim as opt
 
@@ -52,11 +52,16 @@ class Memory:
 
 
 class Actor(nn.Module):
-    def __init__(self, in_features: int, out_features: int, hidden_size: int):
+    def __init__(self, in_features: int, out_features: int, hidden_size: int, continuous: bool):
         super(Actor, self).__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.hidden_size = hidden_size
+        self.continuous = continuous
+
+        if continuous:
+            self.log_std = nn.Parameter(T.zeros(out_features))
+
         self.layers = nn.Sequential(
             nn.Linear(in_features, hidden_size),
             nn.ReLU(),
@@ -68,6 +73,11 @@ class Actor(nn.Module):
         )
 
     def forward(self, states: T.tensor) -> T.tensor:
+        if self.continuous:
+            mean = self.layers(states)
+            std = T.exp(self.log_std)
+            return Normal(mean, std)
+        
         logits = self.layers(states)
         return Categorical(logits = logits)
 
@@ -219,7 +229,11 @@ class Agent():
                 b_advantages = advantages[batch].detach()
 
                 dists = self.actor.forward(b_states)
-                new_probs = dists.log_prob(b_actions)
+                if self.actor.continuous:
+                    new_probs = dists.log_prob(b_actions).sum(dim = -1)
+                else:
+                    new_probs = dists.log_prob(b_actions)
+
                 ratio = (new_probs - b_old_probs).exp()
 
                 critic_loss = ((returns[batch] - self.get_state_values(b_states).squeeze()) ** 2).mean()
@@ -239,12 +253,15 @@ def train(env, agent: Agent, num_envs: int, train_iters: int, timesteps: int, K:
         states, _ = env.reset()
         
         for _ in range(timesteps):
-            states = states.to(agent.device)
+            states = states.to(agent.device, dtype = T.float32)
             actions, probs = agent.select_action(states)
-            state_vals = agent.get_state_values(states)
 
+            if agent.actor.continuous:
+                probs = probs.sum(dim = -1)
+
+            state_vals = agent.get_state_values(states)
             next_states, rewards, dones, terminated, _ = env.step(actions.cpu())
-            next_states = next_states.to(agent.device)
+            next_states = next_states.to(agent.device, dtype = T.float32)
 
             ep_reward += sum(rewards).item()
 
